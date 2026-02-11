@@ -14,29 +14,27 @@
 # Run:
 #   docker run --gpus all -p 5001:5001 docling-serve-cu128-custom
 
-FROM ghcr.io/astral-sh/uv:latest AS uv
-
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
 
 # ---------- System packages ----------
+# Ubuntu 24.04 ships Python 3.12 natively (no PPA needed)
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv python3.12-distutils \
+        python3.12 python3.12-dev python3.12-venv \
         # Build tools
         ninja-build g++ pkg-config \
         # OCR
         tesseract-ocr tesseract-ocr-eng libleptonica-dev \
         # OpenCV runtime deps
-        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
         # Utilities
         git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- uv package manager ----------
-COPY --from=uv /uv /uvx /bin/
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv && \
+    mv /root/.local/bin/uvx /usr/local/bin/uvx
 
 # ---------- Directory layout ----------
 ENV APP_ROOT=/opt/app-root
@@ -134,7 +132,7 @@ ENV DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda
 ENV DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm
 
 # OCR
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata/
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/
 
 # Docling-serve runtime
 ENV DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend
