@@ -1,0 +1,5 @@
+.git
+*.md
+sample_attention.pdf
+benchmark.sh
+.claude

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# GPU-optimized Dockerfile for docling-serve with CUDA 12.8
+# GPU-optimized multi-stage Dockerfile for docling-serve with CUDA 12.8
 #
 # Fixes critical bugs in the official docling-serve-cu128 image:
 #   1. ONNX Runtime runs on CPU (ships onnxruntime instead of onnxruntime-gpu)
@@ -8,26 +8,28 @@
 #   3. CUDA pip libraries not on LD_LIBRARY_PATH
 #   4. cuDNN not wired from pip-installed nvidia-cudnn-cu12
 #
+# Multi-stage build: compiles in devel image, runs in runtime image (~3-5GB smaller)
+#
+# flash-attn note: FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE installs prebuilt wheels
+# with kernels for compute capability 8.0+ (H100/H200). Local GPUs with cap < 8
+# won't use flash-attn, but it's required for production H100/H200 deployment.
+#
 # Build:
-#   docker build -t docling-serve-cu128-custom .
+#   DOCKER_BUILDKIT=1 docker build -t docling-serve-cu128-custom .
 #
 # Run:
 #   docker run --gpus all -p 5001:5001 docling-serve-cu128-custom
 
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+# ============================================================
+# Stage 1: builder (devel image — has nvcc, CUDA headers)
+# ============================================================
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
 
-# ---------- System packages ----------
-# Ubuntu 24.04 ships Python 3.12 natively (no PPA needed)
 ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-dev python3.12-venv \
-        # Build tools
         ninja-build g++ pkg-config \
-        # OCR
-        tesseract-ocr tesseract-ocr-eng libleptonica-dev \
-        # OpenCV runtime deps
-        libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
-        # Utilities
         git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,8 +39,13 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uvx /usr/local/bin/uvx
 
 # ---------- Directory layout ----------
-ENV APP_ROOT=/opt/app-root
-ENV HOME=/opt/app-root/src
+ENV APP_ROOT=/opt/app-root \
+    HOME=/opt/app-root/src \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/app-root \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_CACHE_DIR=/opt/uv/cache
 
 RUN mkdir -p \
         /opt/app-root/src/.local/bin \
@@ -48,16 +55,9 @@ RUN mkdir -p \
         /opt/uv/python \
         /opt/uv/cache
 
-WORKDIR /opt/app-root/src
-
-# ---------- uv settings ----------
-ENV UV_COMPILE_BYTECODE=1
-ENV UV_LINK_MODE=copy
-ENV UV_PROJECT_ENVIRONMENT=/opt/app-root
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-ENV UV_CACHE_DIR=/opt/uv/cache
-
 ENV PATH=/opt/app-root/src/.local/bin:/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+WORKDIR /opt/app-root/src
 
 # ---------- Create venv ----------
 RUN uv venv --python /usr/bin/python3.12 --clear /opt/app-root
@@ -69,32 +69,27 @@ RUN git clone --depth 1 --branch ${DOCLING_SERVE_REF} \
 
 # ---------- Install dependencies (two-pass for flash-attn) ----------
 # Pass 1: everything except flash-attn (no CUDA compilation needed)
-RUN cd /opt/docling-serve && \
+RUN --mount=type=cache,target=/opt/uv/cache \
+    cd /opt/docling-serve && \
     umask 002 && \
-    uv sync --frozen --no-dev --all-extras \
+    uv sync --frozen --no-dev --no-editable --all-extras \
         --no-group pypi --group cu128 \
         --no-extra flash-attn
 
-# Pass 2: flash-attn with CUDA compilation
+# Pass 2: flash-attn — use prebuilt wheel (kernels for compute cap 8.0+, i.e. H100/H200)
+# FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE avoids compiling from source
 ENV FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE
-RUN cd /opt/docling-serve && \
+RUN --mount=type=cache,target=/opt/uv/cache \
+    cd /opt/docling-serve && \
     umask 002 && \
-    uv sync --frozen --no-dev --all-extras \
+    uv sync --frozen --no-dev --no-editable --all-extras \
         --no-group pypi --group cu128 \
         --no-build-isolation-package=flash-attn
 
 # ---------- Fix ONNX Runtime: swap CPU for GPU (critical) ----------
-RUN uv pip uninstall onnxruntime && \
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip uninstall onnxruntime && \
     uv pip install --no-cache-dir onnxruntime-gpu
-
-# ---------- Wire NVIDIA pip libraries into the dynamic linker ----------
-RUN find /opt/app-root/lib/python3.12/site-packages/nvidia \
-        -maxdepth 2 -type d -name lib -print \
-        > /etc/ld.so.conf.d/pip-nvidia.conf && \
-    ldconfig
-
-# Backup: also set LD_LIBRARY_PATH explicitly
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64
 
 # ---------- Build-time verification ----------
 RUN /opt/app-root/bin/python3 -c "\
@@ -106,39 +101,73 @@ assert 'CUDAExecutionProvider' in providers, \
 print('ONNX Runtime GPU verification: PASSED'); \
 "
 
+# ---------- Cleanup & permission prep before COPY to runtime ----------
+# Set group=user perms here so runtime COPY --chown doesn't need a separate chmod layer
+RUN rm -rf /opt/docling-serve /opt/uv/cache \
+    && find /opt/app-root -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+    && chmod -R g=u /opt/app-root
+
+# ============================================================
+# Stage 2: runtime (runtime image — much smaller, no nvcc/headers)
+# ============================================================
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Only runtime system deps — NO ninja, g++, git, python3.12-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv \
+        tesseract-ocr tesseract-ocr-eng libleptonica-dev \
+        libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
+        curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Copy venv + uv from builder ----------
+# Use --chown to set ownership during COPY (avoids a huge duplicate layer from chown -R later)
+COPY --chown=1001:0 --from=builder /opt/app-root /opt/app-root
+COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+
+# ---------- Wire NVIDIA pip libraries into the dynamic linker ----------
+# pip-installed nvidia packages (cudnn, nccl, etc.) bring their own .so libs
+# inside site-packages — wire them via ldconfig so the runtime finds them
+RUN find /opt/app-root/lib/python3.12/site-packages/nvidia \
+        -maxdepth 2 -type d -name lib -print \
+        > /etc/ld.so.conf.d/pip-nvidia.conf && \
+    ldconfig
+
 # ---------- Environment variables ----------
-# CUDA / GPU
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV APP_ROOT=/opt/app-root \
+    HOME=/opt/app-root/src \
+    PATH=/opt/app-root/src/.local/bin:/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64 \
+    # CUDA / GPU
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    # Docling artifacts
+    DOCLING_SERVE_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models \
+    DOCLING_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models \
+    # Caches
+    HF_HOME=/opt/app-root/src/.cache/huggingface \
+    TRANSFORMERS_CACHE=/opt/app-root/src/.cache/huggingface \
+    HF_HUB_CACHE=/opt/app-root/src/.cache/huggingface/hub \
+    TORCH_HOME=/opt/app-root/src/.cache/torch \
+    # Performance
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    # VLM picture description
+    DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
+    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.0-2b \
+    DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda \
+    DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm \
+    # OCR
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/ \
+    # Docling-serve runtime
+    DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend \
+    DOCLING_SERVE_MAX_SYNC_WAIT=1200 \
+    DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200 \
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
 
-# Docling artifacts
-ENV DOCLING_SERVE_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models
-ENV DOCLING_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models
-
-# Caches
-ENV HF_HOME=/opt/app-root/src/.cache/huggingface
-ENV TRANSFORMERS_CACHE=/opt/app-root/src/.cache/huggingface
-ENV HF_HUB_CACHE=/opt/app-root/src/.cache/huggingface/hub
-ENV TORCH_HOME=/opt/app-root/src/.cache/torch
-
-# Performance
-ENV OMP_NUM_THREADS=4
-ENV MKL_NUM_THREADS=4
-
-# VLM picture description
-ENV DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm
-ENV DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.0-2b
-ENV DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda
-ENV DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm
-
-# OCR
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/
-
-# Docling-serve runtime
-ENV DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend
-ENV DOCLING_SERVE_MAX_SYNC_WAIT=1200
-ENV DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200
-ENV DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+WORKDIR /opt/app-root/src
 
 # ---------- Pre-download models for offline operation ----------
 RUN HF_HUB_DOWNLOAD_TIMEOUT=90 HF_HUB_ETAG_TIMEOUT=90 \
@@ -160,8 +189,11 @@ RUN printf '%s\n' \
     chmod +x /usr/local/bin/container-entrypoint
 
 # ---------- Non-root user ----------
-RUN chown -R 1001:0 /opt/app-root /tmp && \
-    chmod -R g=u /opt/app-root /tmp
+# /opt/app-root already owned by 1001:0 (COPY --chown) with g=u perms (set in builder)
+# Create passwd entry for UID 1001 — PyTorch's getpass.getuser() needs it
+RUN echo "docling:x:1001:0:docling:/opt/app-root/src:/bin/bash" >> /etc/passwd && \
+    chown -R 1001:0 /tmp && \
+    chmod -R g=u /tmp
 
 USER 1001
 
