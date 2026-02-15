@@ -12,6 +12,7 @@ The official `docling-serve-cu128` Docker image has several bugs that cause GPU 
 | flash-attn fails to compile | Runtime base image lacks nvcc/CUDA headers | Use `nvidia/cuda:12.8.0-devel-ubuntu22.04` base |
 | CUDA libraries not found | pip NVIDIA packages not on `LD_LIBRARY_PATH` | ldconfig wiring for all nvidia pip package lib dirs |
 | cuDNN not available | devel image doesn't include cuDNN | PyTorch cu128 wheels bring `nvidia-cudnn-cu12`; wired via ldconfig |
+| RapidOCR runs on CPU despite GPU | docling sets `Det.use_cuda` but RapidOCR reads `EngineConfig.onnxruntime.use_cuda` (defaults false) | Patch `rapid_ocr_model.py` to set `EngineConfig.onnxruntime.use_cuda` |
 
 References:
 - [docling#2528](https://github.com/docling-project/docling/issues/2528) - ONNX CPU-only bug

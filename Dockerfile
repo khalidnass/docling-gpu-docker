@@ -7,6 +7,8 @@
 #   2. flash-attn cannot compile (runtime image lacks nvcc/CUDA headers)
 #   3. CUDA pip libraries not on LD_LIBRARY_PATH
 #   4. cuDNN not wired from pip-installed nvidia-cudnn-cu12
+#   5. RapidOCR ignores GPU (docling sets Det.use_cuda but ProviderConfig reads
+#      EngineConfig.onnxruntime.use_cuda which defaults to false)
 #
 # Multi-stage build: compiles in devel image, runs in runtime image (~3-5GB smaller)
 #
@@ -187,6 +189,16 @@ RUN printf '%s\n' \
         'exec "$@"' \
     > /usr/local/bin/container-entrypoint && \
     chmod +x /usr/local/bin/container-entrypoint
+
+# ---------- Fix RapidOCR CUDA: patch docling to set EngineConfig.onnxruntime.use_cuda ----------
+# Bug: docling sets Det.use_cuda=True but RapidOCR's ProviderConfig reads
+# EngineConfig.onnxruntime.use_cuda (defaults to false), so OCR runs on CPU.
+# This sed adds the missing onnxruntime engine config entries to rapid_ocr_model.py.
+RUN RAPID_OCR_MODEL=/opt/app-root/lib/python3.12/site-packages/docling/models/stages/ocr/rapid_ocr_model.py && \
+    sed -i 's|"EngineConfig.paddle.use_cuda": use_cuda,|"EngineConfig.onnxruntime.use_cuda": use_cuda,\n                "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": gpu_id,\n                "EngineConfig.paddle.use_cuda": use_cuda,|' \
+        "$RAPID_OCR_MODEL" && \
+    grep -q 'EngineConfig.onnxruntime.use_cuda' "$RAPID_OCR_MODEL" || \
+        { echo "FATAL: RapidOCR CUDA patch failed"; exit 1; }
 
 # ---------- Non-root user ----------
 # /opt/app-root already owned by 1001:0 (COPY --chown) with g=u perms (set in builder)
