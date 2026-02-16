@@ -158,7 +158,7 @@ ENV APP_ROOT=/opt/app-root \
     MKL_NUM_THREADS=4 \
     # VLM picture description
     DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
-    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.0-2b \
+    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.3-2b \
     DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda \
     DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm \
     # OCR
