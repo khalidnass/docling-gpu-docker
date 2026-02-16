@@ -190,6 +190,11 @@ RUN printf '%s\n' \
     > /usr/local/bin/container-entrypoint && \
     chmod +x /usr/local/bin/container-entrypoint
 
+# ---------- Fix security vulnerabilities (GHSA-cfh3-3jmp-rvhc, GHSA-r6ph-v2qm-q3c2) ----------
+RUN uv pip install --no-cache-dir --python /opt/app-root/bin/python3 \
+        "pillow>=12.1.1" \
+        "cryptography>=46.0.5"
+
 # ---------- Fix RapidOCR CUDA: patch docling to set EngineConfig.onnxruntime.use_cuda ----------
 # Bug: docling sets Det.use_cuda=True but RapidOCR's ProviderConfig reads
 # EngineConfig.onnxruntime.use_cuda (defaults to false), so OCR runs on CPU.
