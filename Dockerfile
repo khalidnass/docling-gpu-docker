@@ -93,6 +93,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip uninstall onnxruntime && \
     uv pip install --no-cache-dir onnxruntime-gpu
 
+# ---------- Fix security vulnerabilities in builder (so COPY layer is clean) ----------
+# Must be done here, NOT in runtime stage, otherwise Trivy flags the old
+# versions in the COPY layer (GHSA-cfh3-3jmp-rvhc, GHSA-r6ph-v2qm-q3c2)
+RUN uv pip install --no-cache-dir \
+        "pillow>=12.1.1" \
+        "cryptography>=46.0.5"
+
 # ---------- Build-time verification ----------
 RUN /opt/app-root/bin/python3 -c "\
 import onnxruntime as ort; \
@@ -117,11 +124,13 @@ FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Only runtime system deps — NO ninja, g++, git, python3.12-dev
+# Also upgrade gnupg to fix CVE-2025-68973
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
         tesseract-ocr tesseract-ocr-eng libleptonica-dev \
         libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
         curl ca-certificates \
+    && apt-get upgrade -y gnupg gpgv \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- Copy venv + uv from builder ----------
@@ -137,7 +146,7 @@ RUN find /opt/app-root/lib/python3.12/site-packages/nvidia \
         > /etc/ld.so.conf.d/pip-nvidia.conf && \
     ldconfig
 
-# ---------- Environment variables ----------
+# ---------- Environment variables (stable — changing these invalidates model cache) ----------
 ENV APP_ROOT=/opt/app-root \
     HOME=/opt/app-root/src \
     PATH=/opt/app-root/src/.local/bin:/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -156,37 +165,48 @@ ENV APP_ROOT=/opt/app-root \
     # Performance
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4 \
-    # Disable torch.compile inductor (fails on GPUs with fewer SMs like A5000/T4)
+    # OCR
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/
+
+WORKDIR /opt/app-root/src
+
+# ---------- Copy pre-downloaded models (no network needed) ----------
+# Models are copied from the build context's models/ directory.
+# Required models: docling-layout-heron, docling-models (tableformer),
+#   DocumentFigureClassifier-v2.0, RapidOcr, EasyOcr
+# Build with: DOCKER_BUILDKIT=1 docker build -t docling-serve-cu128-custom .
+#   (ensure models/ dir exists in build context — see README)
+COPY --chown=1001:0 models/docling-project--docling-layout-heron   ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--docling-layout-heron
+COPY --chown=1001:0 models/docling-project--docling-models         ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--docling-models
+COPY --chown=1001:0 models/docling-project--DocumentFigureClassifier-v2.0 ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0
+COPY --chown=1001:0 models/RapidOcr                                ${DOCLING_SERVE_ARTIFACTS_PATH}/RapidOcr
+COPY --chown=1001:0 models/EasyOcr                                 ${DOCLING_SERVE_ARTIFACTS_PATH}/EasyOcr
+
+# ---------- Tuning & feature ENV (safe to change without re-downloading models) ----------
+ENV TORCH_COMPILE_DISABLE=1 \
     TORCHINDUCTOR_DISABLE=1 \
     # VLM picture description
     DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
     DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.3-2b \
     DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda \
     DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm \
-    # OCR
-    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/ \
     # Docling-serve runtime
     DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend \
     DOCLING_SERVE_MAX_SYNC_WAIT=1200 \
     DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200 \
     DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
 
-WORKDIR /opt/app-root/src
-
-# ---------- Pre-download models for offline operation ----------
-RUN HF_HUB_DOWNLOAD_TIMEOUT=90 HF_HUB_ETAG_TIMEOUT=90 \
-    /opt/app-root/bin/docling-tools models download \
-        -o "${DOCLING_SERVE_ARTIFACTS_PATH}" \
-        layout tableformer picture_classifier rapidocr easyocr
-
-# ---------- Fix DocumentFigureClassifier v2.0 path ----------
-# docling v1.12+ looks for "DocumentFigureClassifier-v2.0" but the downloaded
-# model is named "DocumentFigureClassifier". Create symlink so both names work.
-RUN ln -sf "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier" \
-           "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0"
+# ---------- Save baked-in classifier to a safe location ----------
+# Volume mounts can overlay /opt/app-root/src/.cache/docling/models, hiding the
+# correct v2.0 classifier. Keep a pristine copy outside the mount path.
+# docling-tools v1.12 downloads as "DocumentFigureClassifier-v2.0" directly.
+RUN cp -a "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0" \
+          /opt/app-root/docling-project--DocumentFigureClassifier-v2.0-baked
 
 # ---------- container-entrypoint shim ----------
-# Also creates the classifier symlink at runtime for volume-mounted models
+# Ensures the v2.0 classifier is available even with volume-mounted models.
+# On OpenShift the volume may contain only the old v1 model (16 classes) or
+# no classifier at all — this copies the baked-in v2.0 model if needed.
 RUN printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -e' \
@@ -195,20 +215,29 @@ RUN printf '%s\n' \
         '(chown -R 1001:0 /opt/app-root/src/.cache 2>/dev/null || true)' \
         '(chmod -R g+rwX /opt/app-root/src/.cache 2>/dev/null || true)' \
         '' \
-        '# Fix DocumentFigureClassifier path for volume-mounted models' \
+        '# Fix DocumentFigureClassifier v2.0 for volume-mounted models' \
         'MODELS="${DOCLING_SERVE_ARTIFACTS_PATH:-/opt/app-root/src/.cache/docling/models}"' \
-        'if [ -d "$MODELS/docling-project--DocumentFigureClassifier" ] && [ ! -e "$MODELS/docling-project--DocumentFigureClassifier-v2.0" ]; then' \
-        '    ln -sf "$MODELS/docling-project--DocumentFigureClassifier" "$MODELS/docling-project--DocumentFigureClassifier-v2.0" 2>/dev/null || true' \
+        'BAKED=/opt/app-root/docling-project--DocumentFigureClassifier-v2.0-baked' \
+        'TARGET="$MODELS/docling-project--DocumentFigureClassifier-v2.0"' \
+        '' \
+        '# If v2.0 dir missing or is a broken symlink, copy baked-in model' \
+        'if [ ! -d "$TARGET" ] || [ ! -f "$TARGET/config.json" ]; then' \
+        '    echo "[entrypoint] Copying baked-in DocumentFigureClassifier-v2.0 to $TARGET"' \
+        '    rm -rf "$TARGET" 2>/dev/null || true' \
+        '    cp -a "$BAKED" "$TARGET" 2>/dev/null || {' \
+        '        echo "[entrypoint] WARNING: Could not copy classifier model (read-only fs?). Trying symlink..."' \
+        '        ln -sf "$BAKED" "$TARGET" 2>/dev/null || echo "[entrypoint] WARNING: Classification may not work"' \
+        '    }' \
+        'fi' \
+        '' \
+        '# Also ensure the non-versioned name resolves (some code paths use it)' \
+        'if [ ! -e "$MODELS/docling-project--DocumentFigureClassifier" ]; then' \
+        '    ln -sf "$TARGET" "$MODELS/docling-project--DocumentFigureClassifier" 2>/dev/null || true' \
         'fi' \
         '' \
         'exec "$@"' \
     > /usr/local/bin/container-entrypoint && \
     chmod +x /usr/local/bin/container-entrypoint
-
-# ---------- Fix security vulnerabilities (GHSA-cfh3-3jmp-rvhc, GHSA-r6ph-v2qm-q3c2) ----------
-RUN uv pip install --no-cache-dir --python /opt/app-root/bin/python3 \
-        "pillow>=12.1.1" \
-        "cryptography>=46.0.5"
 
 # ---------- Fix RapidOCR CUDA: patch docling to set EngineConfig.onnxruntime.use_cuda ----------
 # Bug: docling sets Det.use_cuda=True but RapidOCR's ProviderConfig reads
