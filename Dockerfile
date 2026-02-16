@@ -156,6 +156,8 @@ ENV APP_ROOT=/opt/app-root \
     # Performance
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4 \
+    # Disable torch.compile inductor (fails on GPUs with fewer SMs like A5000/T4)
+    TORCHINDUCTOR_DISABLE=1 \
     # VLM picture description
     DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
     DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.3-2b \
@@ -177,7 +179,14 @@ RUN HF_HUB_DOWNLOAD_TIMEOUT=90 HF_HUB_ETAG_TIMEOUT=90 \
         -o "${DOCLING_SERVE_ARTIFACTS_PATH}" \
         layout tableformer picture_classifier rapidocr easyocr
 
+# ---------- Fix DocumentFigureClassifier v2.0 path ----------
+# docling v1.12+ looks for "DocumentFigureClassifier-v2.0" but the downloaded
+# model is named "DocumentFigureClassifier". Create symlink so both names work.
+RUN ln -sf "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier" \
+           "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0"
+
 # ---------- container-entrypoint shim ----------
+# Also creates the classifier symlink at runtime for volume-mounted models
 RUN printf '%s\n' \
         '#!/usr/bin/env bash' \
         'set -e' \
@@ -185,6 +194,12 @@ RUN printf '%s\n' \
         '# Ensure cache dirs are writable for UID 1001' \
         '(chown -R 1001:0 /opt/app-root/src/.cache 2>/dev/null || true)' \
         '(chmod -R g+rwX /opt/app-root/src/.cache 2>/dev/null || true)' \
+        '' \
+        '# Fix DocumentFigureClassifier path for volume-mounted models' \
+        'MODELS="${DOCLING_SERVE_ARTIFACTS_PATH:-/opt/app-root/src/.cache/docling/models}"' \
+        'if [ -d "$MODELS/docling-project--DocumentFigureClassifier" ] && [ ! -e "$MODELS/docling-project--DocumentFigureClassifier-v2.0" ]; then' \
+        '    ln -sf "$MODELS/docling-project--DocumentFigureClassifier" "$MODELS/docling-project--DocumentFigureClassifier-v2.0" 2>/dev/null || true' \
+        'fi' \
         '' \
         'exec "$@"' \
     > /usr/local/bin/container-entrypoint && \
