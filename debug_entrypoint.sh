@@ -4,6 +4,7 @@ set -e
 echo "============================================================"
 echo "  DOCLING-SERVE DEBUG IMAGE"
 echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "  ENABLE_PROFILING=${ENABLE_PROFILING:-true}"
 echo "============================================================"
 
 # ---- Ensure cache dirs are writable for UID 1001 ----
@@ -28,19 +29,22 @@ if [ ! -e "$MODELS/docling-project--DocumentFigureClassifier" ]; then
     ln -sf "$TARGET" "$MODELS/docling-project--DocumentFigureClassifier" 2>/dev/null || true
 fi
 
-# ---- Apply profiling patches ----
-echo "[entrypoint] Installing debug profiling patches..."
-python3 -c "
+# ---- Debug mode: apply profiling patches and print diagnostics ----
+DEBUG_VAL="${ENABLE_PROFILING:-true}"
+if [ "$DEBUG_VAL" = "true" ] || [ "$DEBUG_VAL" = "1" ] || [ "$DEBUG_VAL" = "yes" ]; then
+    echo "[entrypoint] Debug mode ENABLED — [PROFILE] output active"
+    echo "[entrypoint] Set ENABLE_PROFILING=false to disable profiling"
+    echo "[entrypoint] Installing debug profiling patches..."
+    python3 -c "
 from docling.docling_debug_profiler import install, print_startup_diagnostics
 install()
 print_startup_diagnostics()
 " 2>&1 || echo "[entrypoint] WARNING: Profiling patches failed to install"
+else
+    echo "[entrypoint] Debug mode DISABLED — no [PROFILE] output"
+fi
 
-# ---- Force profiling settings via environment ----
-export DOCLING_PROFILE_PIPELINE_TIMINGS=true
-
-# ---- Run the original command with profiling ----
-# The profiling module is auto-loaded via the sitecustomize.py we install
+# ---- Run the original command ----
 echo "[entrypoint] Starting: $@"
 echo "============================================================"
 exec "$@"

@@ -6,15 +6,20 @@
 #   - Full pipeline profiling (every stage logged to stdout)
 #   - Per-crop OCR timing and dimension logging
 #   - VLM inference speed tracking (tokens/sec)
+#   - vLLM backend for 6.8x faster VLM inference
 #   - Standalone model benchmark scripts
 #   - Granite-Docling-258M VLM model for pipeline comparison
 #   - Startup diagnostics
+#   - All debug features toggleable via ENABLE_PROFILING env var
 #
 # Build:
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.debug -t docling-serve-debug .
 #
-# Run:
+# Run (debug enabled by default):
 #   docker run --gpus all -p 5001:5001 docling-serve-debug
+#
+# Run with debug disabled (production mode, OpenShift):
+#   docker run --gpus all -p 5001:5001 -e ENABLE_PROFILING=false docling-serve-debug
 #
 # View profiling output:
 #   docker logs <id> 2>&1 | grep "\[PROFILE\]"
@@ -97,6 +102,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 RUN uv pip install --no-cache-dir \
         "pillow>=12.1.1" \
         "cryptography>=46.0.5"
+
+# ---------- Install vLLM for accelerated VLM inference (6.8x over transformers) ----------
+# vLLM adjusts torch (2.10→2.9.1) and torchvision to compatible versions.
+# Reinstall flash-attn with --no-deps to avoid re-upgrading torch (which would break torchvision).
+# Re-ensure onnxruntime-gpu is present (vLLM may pull in CPU-only onnxruntime).
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install vllm && \
+    uv pip install --no-deps --force-reinstall "flash-attn>=2.7" \
+        --find-links https://github.com/Dao-AILab/flash-attention/releases/expanded_assets/v2.8.3 && \
+    uv pip install --no-cache-dir onnxruntime-gpu
 
 # ---------- Build-time verification ----------
 RUN /opt/app-root/bin/python3 -c "\
@@ -181,7 +196,8 @@ ENV TORCH_COMPILE_DISABLE=1 \
     DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend \
     DOCLING_SERVE_MAX_SYNC_WAIT=1200 \
     DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200 \
-    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2 \
+    ENABLE_PROFILING=true
 
 # ---------- Save baked-in classifier ----------
 RUN cp -a "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0" \
@@ -200,15 +216,15 @@ RUN RAPID_OCR_MODEL=$(find /opt/app-root/lib/python3.12/site-packages/docling -n
 # DEBUG-SPECIFIC LAYERS
 # ============================================================
 
-# ---------- Patch 3.10: TimeRecorder — print to stdout ----------
-# Use print() instead of _log.info() so output appears regardless of logging config
+# ---------- Patch 3.10: TimeRecorder — conditional profiling output ----------
+# Uses dprint() (defined in sitecustomize.py) so output is controlled by ENABLE_PROFILING
 RUN /opt/app-root/bin/python3 -c "\
 import pathlib, glob; \
 f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/utils/profiling.py')[0]; \
 p = pathlib.Path(f); \
 src = p.read_text(); \
 old = 'self.conv_res.timings[self.key].count += 1'; \
-new = old + '\n            print(f\"[PROFILE] {self.key}: {elapsed:.4f}s\", flush=True)'; \
+new = old + '\n            dprint(f\"[PROFILE] {self.key}: {elapsed:.4f}s\")'; \
 assert old in src, f'Pattern not found in {f}'; \
 p.write_text(src.replace(old, new, 1)); \
 print(f'Patched TimeRecorder in {f}'); \
@@ -222,7 +238,7 @@ p = pathlib.Path(f); \
 src = p.read_text(); \
 # Add region count after get_ocr_rects
 old1 = 'ocr_rects = self.get_ocr_rects(page)'; \
-new1 = old1 + '\n                    print(f\"[PROFILE] OCR page {page.page_no}: {len(ocr_rects)} regions detected\", flush=True)'; \
+new1 = old1 + '\n                    dprint(f\"[PROFILE] OCR page {page.page_no}: {len(ocr_rects)} regions detected\")'; \
 src = src.replace(old1, new1, 1); \
 # Add per-crop timer before self.reader() call
 old2 = '                        result = self.reader('; \
@@ -230,7 +246,7 @@ new2 = '                        _ocr_crop_t0 = __import__(\"time\").perf_counter
 src = src.replace(old2, new2, 1); \
 # Add per-crop timing after reader call, before result check
 old3 = '                        if result is None or result.boxes is None:'; \
-new3 = '                        _ocr_crop_elapsed = __import__(\"time\").perf_counter() - _ocr_crop_t0\n                        print(f\"[PROFILE] OCR crop: {im.shape[1]}x{im.shape[0]}px in {_ocr_crop_elapsed:.4f}s\", flush=True)\n' + old3; \
+new3 = '                        _ocr_crop_elapsed = __import__(\"time\").perf_counter() - _ocr_crop_t0\n                        dprint(f\"[PROFILE] OCR crop: {im.shape[1]}x{im.shape[0]}px in {_ocr_crop_elapsed:.4f}s\")\n' + old3; \
 src = src.replace(old3, new3, 1); \
 p.write_text(src); \
 assert '[PROFILE] OCR crop' in p.read_text(), 'Crop patch failed'; \
@@ -244,7 +260,7 @@ f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/**/rapid_ocr_m
 p = pathlib.Path(f); \
 src = p.read_text(); \
 old = '            self.reader = RapidOCR('; \
-new = '            print(f\"[PROFILE] RapidOCR config: backend={backend_enum}, use_cuda={use_cuda}, gpu_id={gpu_id}\", flush=True)\n' + old; \
+new = '            dprint(f\"[PROFILE] RapidOCR config: backend={backend_enum}, use_cuda={use_cuda}, gpu_id={gpu_id}\")\n' + old; \
 src = src.replace(old, new, 1); \
 p.write_text(src); \
 assert '[PROFILE] RapidOCR config' in p.read_text(), 'Config patch failed'; \
@@ -260,7 +276,7 @@ src = p.read_text(); \
 old = '                conv_res.status = self._determine_status(conv_res)'; \
 NL = chr(10); \
 SP = '                '; \
-summary = old + NL + SP + 'print(\"[PROFILE] ===== PIPELINE TIMING SUMMARY =====\", flush=True)' + NL + SP + 'for _tk, _tv in conv_res.timings.items():' + NL + SP + '    if _tv.times:' + NL + SP + '        print(f\"[PROFILE]   {_tk}: count={_tv.count}, total={sum(_tv.times):.4f}s, avg={sum(_tv.times)/len(_tv.times):.4f}s\", flush=True)' + NL + SP + 'print(\"[PROFILE] =====================================\", flush=True)'; \
+summary = old + NL + SP + 'dprint(\"[PROFILE] ===== PIPELINE TIMING SUMMARY =====\")' + NL + SP + 'for _tk, _tv in conv_res.timings.items():' + NL + SP + '    if _tv.times:' + NL + SP + '        dprint(f\"[PROFILE]   {_tk}: count={_tv.count}, total={sum(_tv.times):.4f}s, avg={sum(_tv.times)/len(_tv.times):.4f}s\")' + NL + SP + 'dprint(\"[PROFILE] =====================================\")'; \
 assert old in src, f'Pattern not found in {f}'; \
 src = src.replace(old, summary, 1); \
 p.write_text(src); \
@@ -268,9 +284,8 @@ assert 'PIPELINE TIMING SUMMARY' in p.read_text(), 'Summary patch failed'; \
 print(f'Patched pipeline summary in {f}'); \
 "
 
-# ---------- Force profiling enabled ----------
-ENV DOCLING_PROFILE_PIPELINE_TIMINGS=true \
-    PYTHONUNBUFFERED=1
+# ---------- Profiling control ----------
+ENV PYTHONUNBUFFERED=1
 
 # ---------- Copy debug scripts ----------
 COPY --chown=1001:0 docling_debug_profiler.py /opt/app-root/lib/python3.12/site-packages/docling/docling_debug_profiler.py
@@ -278,19 +293,30 @@ COPY --chown=1001:0 benchmark_models.py /opt/app-root/src/benchmark_models.py
 COPY --chown=1001:0 benchmark_onnx_sessions.py /opt/app-root/src/benchmark_onnx_sessions.py
 COPY --chown=1001:0 test_docling.py /opt/app-root/src/test_docling.py
 
-# ---------- Enable profiling via system sitecustomize.py + .pth file ----------
-# Write to SYSTEM sitecustomize.py (the one Python actually auto-loads)
+# ---------- Enable profiling via system sitecustomize.py ----------
+# Defines builtins.dprint() — a conditional print controlled by ENABLE_PROFILING env var.
+# When ENABLE_PROFILING=false, all [PROFILE] output is suppressed silently.
+# Also enables docling's internal TimeRecorder when debug is on.
 RUN printf '%s\n' \
-    '# Docling debug profiling auto-enable' \
-    'import os' \
-    'os.environ.setdefault("DOCLING_PROFILE_PIPELINE_TIMINGS", "true")' \
-    'def _enable_docling_profiling():' \
-    '    try:' \
-    '        from docling.datamodel.settings import settings' \
-    '        settings.debug.profile_pipeline_timings = True' \
-    '    except Exception:' \
-    '        pass' \
-    '_enable_docling_profiling()' \
+    '# Docling debug: conditional profiling controlled by ENABLE_PROFILING env var' \
+    'import os, builtins' \
+    '' \
+    '_debug = os.environ.get("ENABLE_PROFILING", "true").lower() in ("true", "1", "yes")' \
+    '' \
+    'def _dprint(msg):' \
+    '    if _debug:' \
+    '        print(msg, flush=True)' \
+    '' \
+    'builtins.dprint = _dprint' \
+    '' \
+    'if _debug:' \
+    '    def _enable_docling_profiling():' \
+    '        try:' \
+    '            from docling.datamodel.settings import settings' \
+    '            settings.debug.profile_pipeline_timings = True' \
+    '        except Exception:' \
+    '            pass' \
+    '    _enable_docling_profiling()' \
     > /usr/lib/python3.12/sitecustomize.py && \
     rm -f /usr/lib/python3.12/__pycache__/sitecustomize*.pyc
 
