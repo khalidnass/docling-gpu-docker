@@ -1,0 +1,311 @@
+# syntax=docker/dockerfile:1
+#
+# DEBUG GPU-optimized Dockerfile for docling-serve with CUDA 12.8
+#
+# Extends the production Dockerfile with:
+#   - Full pipeline profiling (every stage logged to stdout)
+#   - Per-crop OCR timing and dimension logging
+#   - VLM inference speed tracking (tokens/sec)
+#   - Standalone model benchmark scripts
+#   - Granite-Docling-258M VLM model for pipeline comparison
+#   - Startup diagnostics
+#
+# Build:
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.debug -t docling-serve-debug .
+#
+# Run:
+#   docker run --gpus all -p 5001:5001 docling-serve-debug
+#
+# View profiling output:
+#   docker logs <id> 2>&1 | grep "\[PROFILE\]"
+#
+# Run standalone benchmarks:
+#   docker exec -it <id> python3 /opt/app-root/src/benchmark_models.py
+#   docker exec -it <id> python3 /opt/app-root/src/benchmark_onnx_sessions.py
+
+# ============================================================
+# Stage 1: builder (devel image — has nvcc, CUDA headers)
+# ============================================================
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+        ninja-build g++ pkg-config \
+        git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- uv package manager ----------
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv && \
+    mv /root/.local/bin/uvx /usr/local/bin/uvx
+
+# ---------- Directory layout ----------
+ENV APP_ROOT=/opt/app-root \
+    HOME=/opt/app-root/src \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/app-root \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_CACHE_DIR=/opt/uv/cache
+
+RUN mkdir -p \
+        /opt/app-root/src/.local/bin \
+        /opt/app-root/src/.cache/docling/models \
+        /opt/app-root/src/.cache/huggingface/hub \
+        /opt/app-root/src/.cache/torch \
+        /opt/uv/python \
+        /opt/uv/cache
+
+ENV PATH=/opt/app-root/src/.local/bin:/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+WORKDIR /opt/app-root/src
+
+# ---------- Create venv ----------
+RUN uv venv --python /usr/bin/python3.12 --clear /opt/app-root
+
+# ---------- Clone docling-serve ----------
+ARG DOCLING_SERVE_REF=v1.12.0
+RUN git clone --depth 1 --branch ${DOCLING_SERVE_REF} \
+        https://github.com/docling-project/docling-serve.git /opt/docling-serve
+
+# ---------- Install dependencies (two-pass for flash-attn) ----------
+# Pass 1: everything except flash-attn (no CUDA compilation needed)
+RUN --mount=type=cache,target=/opt/uv/cache \
+    cd /opt/docling-serve && \
+    umask 002 && \
+    uv sync --frozen --no-dev --no-editable --all-extras \
+        --no-group pypi --group cu128 \
+        --no-extra flash-attn
+
+# Pass 2: flash-attn — use prebuilt wheel (kernels for compute cap 8.0+, i.e. H100/H200)
+ENV FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE
+RUN --mount=type=cache,target=/opt/uv/cache \
+    cd /opt/docling-serve && \
+    umask 002 && \
+    uv sync --frozen --no-dev --no-editable --all-extras \
+        --no-group pypi --group cu128 \
+        --no-build-isolation-package=flash-attn
+
+# ---------- Fix ONNX Runtime: swap CPU for GPU (critical) ----------
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip uninstall onnxruntime && \
+    uv pip install --no-cache-dir onnxruntime-gpu
+
+# ---------- Fix security vulnerabilities in builder (so COPY layer is clean) ----------
+RUN uv pip install --no-cache-dir \
+        "pillow>=12.1.1" \
+        "cryptography>=46.0.5"
+
+# ---------- Build-time verification ----------
+RUN /opt/app-root/bin/python3 -c "\
+import onnxruntime as ort; \
+providers = ort.get_available_providers(); \
+print('ORT providers:', providers); \
+assert 'CUDAExecutionProvider' in providers, \
+    f'CUDAExecutionProvider missing! Got: {providers}'; \
+print('ONNX Runtime GPU verification: PASSED'); \
+"
+
+# ---------- Cleanup & permission prep before COPY to runtime ----------
+RUN rm -rf /opt/docling-serve /opt/uv/cache \
+    && find /opt/app-root -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+    && chmod -R g=u /opt/app-root
+
+# ============================================================
+# Stage 2: runtime (runtime image — much smaller, no nvcc/headers)
+# ============================================================
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv \
+        tesseract-ocr tesseract-ocr-eng libleptonica-dev \
+        libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
+        curl ca-certificates \
+    && apt-get upgrade -y gnupg gpgv \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------- Copy venv + uv from builder ----------
+COPY --chown=1001:0 --from=builder /opt/app-root /opt/app-root
+COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
+
+# ---------- Wire NVIDIA pip libraries into the dynamic linker ----------
+RUN find /opt/app-root/lib/python3.12/site-packages/nvidia \
+        -maxdepth 2 -type d -name lib -print \
+        > /etc/ld.so.conf.d/pip-nvidia.conf && \
+    ldconfig
+
+# ---------- Environment variables ----------
+ENV APP_ROOT=/opt/app-root \
+    HOME=/opt/app-root/src \
+    PATH=/opt/app-root/src/.local/bin:/opt/app-root/src/bin:/opt/app-root/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    DOCLING_SERVE_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models \
+    DOCLING_ARTIFACTS_PATH=/opt/app-root/src/.cache/docling/models \
+    HF_HOME=/opt/app-root/src/.cache/huggingface \
+    TRANSFORMERS_CACHE=/opt/app-root/src/.cache/huggingface \
+    HF_HUB_CACHE=/opt/app-root/src/.cache/huggingface/hub \
+    TORCH_HOME=/opt/app-root/src/.cache/torch \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata/
+
+WORKDIR /opt/app-root/src
+
+# ---------- Copy pre-downloaded models (standard pipeline) ----------
+COPY --chown=1001:0 models/docling-project--docling-layout-heron   ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--docling-layout-heron
+COPY --chown=1001:0 models/docling-project--docling-models         ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--docling-models
+COPY --chown=1001:0 models/docling-project--DocumentFigureClassifier-v2.0 ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0
+COPY --chown=1001:0 models/RapidOcr                                ${DOCLING_SERVE_ARTIFACTS_PATH}/RapidOcr
+COPY --chown=1001:0 models/EasyOcr                                 ${DOCLING_SERVE_ARTIFACTS_PATH}/EasyOcr
+
+# ---------- Copy VLM models for debug/benchmarking ----------
+# granite-docling-258M: single-pass VLM for full document conversion
+# Before building, copy the model into the build context:
+#   cp -a ~/neo/docling-models/ibm-granite--granite-docling-258M models/
+COPY --chown=1001:0 models/ibm-granite--granite-docling-258M \
+    ${DOCLING_SERVE_ARTIFACTS_PATH}/ibm-granite--granite-docling-258M
+
+# ---------- Tuning & feature ENV ----------
+ENV TORCH_COMPILE_DISABLE=1 \
+    TORCHINDUCTOR_DISABLE=1 \
+    DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
+    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.3-2b \
+    DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda \
+    DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm \
+    DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend \
+    DOCLING_SERVE_MAX_SYNC_WAIT=1200 \
+    DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200 \
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+
+# ---------- Save baked-in classifier ----------
+RUN cp -a "${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0" \
+          /opt/app-root/docling-project--DocumentFigureClassifier-v2.0-baked
+
+# ---------- Fix RapidOCR CUDA ----------
+# Find the file regardless of whether it's in models/ or models/stages/ocr/
+RUN RAPID_OCR_MODEL=$(find /opt/app-root/lib/python3.12/site-packages/docling -name "rapid_ocr_model.py" | head -1) && \
+    echo "Patching: $RAPID_OCR_MODEL" && \
+    sed -i 's|"EngineConfig.paddle.use_cuda": use_cuda,|"EngineConfig.onnxruntime.use_cuda": use_cuda,\n                "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": gpu_id,\n                "EngineConfig.paddle.use_cuda": use_cuda,|' \
+        "$RAPID_OCR_MODEL" && \
+    grep -q 'EngineConfig.onnxruntime.use_cuda' "$RAPID_OCR_MODEL" || \
+        { echo "FATAL: RapidOCR CUDA patch failed"; exit 1; }
+
+# ============================================================
+# DEBUG-SPECIFIC LAYERS
+# ============================================================
+
+# ---------- Patch 3.10: TimeRecorder — print to stdout ----------
+# Use print() instead of _log.info() so output appears regardless of logging config
+RUN /opt/app-root/bin/python3 -c "\
+import pathlib, glob; \
+f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/utils/profiling.py')[0]; \
+p = pathlib.Path(f); \
+src = p.read_text(); \
+old = 'self.conv_res.timings[self.key].count += 1'; \
+new = old + '\n            print(f\"[PROFILE] {self.key}: {elapsed:.4f}s\", flush=True)'; \
+assert old in src, f'Pattern not found in {f}'; \
+p.write_text(src.replace(old, new, 1)); \
+print(f'Patched TimeRecorder in {f}'); \
+"
+
+# ---------- Patch 3.1: RapidOCR per-crop timing + region count ----------
+RUN /opt/app-root/bin/python3 -c "\
+import pathlib, glob; \
+f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/**/rapid_ocr_model.py', recursive=True)[0]; \
+p = pathlib.Path(f); \
+src = p.read_text(); \
+# Add region count after get_ocr_rects
+old1 = 'ocr_rects = self.get_ocr_rects(page)'; \
+new1 = old1 + '\n                    print(f\"[PROFILE] OCR page {page.page_no}: {len(ocr_rects)} regions detected\", flush=True)'; \
+src = src.replace(old1, new1, 1); \
+# Add per-crop timer before self.reader() call
+old2 = '                        result = self.reader('; \
+new2 = '                        _ocr_crop_t0 = __import__(\"time\").perf_counter()\n' + old2; \
+src = src.replace(old2, new2, 1); \
+# Add per-crop timing after reader call, before result check
+old3 = '                        if result is None or result.boxes is None:'; \
+new3 = '                        _ocr_crop_elapsed = __import__(\"time\").perf_counter() - _ocr_crop_t0\n                        print(f\"[PROFILE] OCR crop: {im.shape[1]}x{im.shape[0]}px in {_ocr_crop_elapsed:.4f}s\", flush=True)\n' + old3; \
+src = src.replace(old3, new3, 1); \
+p.write_text(src); \
+assert '[PROFILE] OCR crop' in p.read_text(), 'Crop patch failed'; \
+print(f'Patched RapidOCR per-crop in {f}'); \
+"
+
+# ---------- Patch 3.2: RapidOCR GPU config at init ----------
+RUN /opt/app-root/bin/python3 -c "\
+import pathlib, glob; \
+f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/**/rapid_ocr_model.py', recursive=True)[0]; \
+p = pathlib.Path(f); \
+src = p.read_text(); \
+old = '            self.reader = RapidOCR('; \
+new = '            print(f\"[PROFILE] RapidOCR config: backend={backend_enum}, use_cuda={use_cuda}, gpu_id={gpu_id}\", flush=True)\n' + old; \
+src = src.replace(old, new, 1); \
+p.write_text(src); \
+assert '[PROFILE] RapidOCR config' in p.read_text(), 'Config patch failed'; \
+print(f'Patched RapidOCR config logging in {f}'); \
+"
+
+# ---------- Patch 3.9: Pipeline timing summary ----------
+RUN /opt/app-root/bin/python3 -c "\
+import pathlib, glob; \
+f = glob.glob('/opt/app-root/lib/python3.12/site-packages/docling/pipeline/base_pipeline.py')[0]; \
+p = pathlib.Path(f); \
+src = p.read_text(); \
+old = '                conv_res.status = self._determine_status(conv_res)'; \
+NL = chr(10); \
+SP = '                '; \
+summary = old + NL + SP + 'print(\"[PROFILE] ===== PIPELINE TIMING SUMMARY =====\", flush=True)' + NL + SP + 'for _tk, _tv in conv_res.timings.items():' + NL + SP + '    if _tv.times:' + NL + SP + '        print(f\"[PROFILE]   {_tk}: count={_tv.count}, total={sum(_tv.times):.4f}s, avg={sum(_tv.times)/len(_tv.times):.4f}s\", flush=True)' + NL + SP + 'print(\"[PROFILE] =====================================\", flush=True)'; \
+assert old in src, f'Pattern not found in {f}'; \
+src = src.replace(old, summary, 1); \
+p.write_text(src); \
+assert 'PIPELINE TIMING SUMMARY' in p.read_text(), 'Summary patch failed'; \
+print(f'Patched pipeline summary in {f}'); \
+"
+
+# ---------- Force profiling enabled ----------
+ENV DOCLING_PROFILE_PIPELINE_TIMINGS=true \
+    PYTHONUNBUFFERED=1
+
+# ---------- Copy debug scripts ----------
+COPY --chown=1001:0 docling_debug_profiler.py /opt/app-root/lib/python3.12/site-packages/docling/docling_debug_profiler.py
+COPY --chown=1001:0 benchmark_models.py /opt/app-root/src/benchmark_models.py
+COPY --chown=1001:0 benchmark_onnx_sessions.py /opt/app-root/src/benchmark_onnx_sessions.py
+COPY --chown=1001:0 test_docling.py /opt/app-root/src/test_docling.py
+
+# ---------- Enable profiling via system sitecustomize.py + .pth file ----------
+# Write to SYSTEM sitecustomize.py (the one Python actually auto-loads)
+RUN printf '%s\n' \
+    '# Docling debug profiling auto-enable' \
+    'import os' \
+    'os.environ.setdefault("DOCLING_PROFILE_PIPELINE_TIMINGS", "true")' \
+    'def _enable_docling_profiling():' \
+    '    try:' \
+    '        from docling.datamodel.settings import settings' \
+    '        settings.debug.profile_pipeline_timings = True' \
+    '    except Exception:' \
+    '        pass' \
+    '_enable_docling_profiling()' \
+    > /usr/lib/python3.12/sitecustomize.py && \
+    rm -f /usr/lib/python3.12/__pycache__/sitecustomize*.pyc
+
+# ---------- Debug entrypoint ----------
+COPY --chown=1001:0 debug_entrypoint.sh /usr/local/bin/debug-entrypoint
+RUN chmod +x /usr/local/bin/debug-entrypoint
+
+# ---------- Non-root user ----------
+RUN echo "docling:x:1001:0:docling:/opt/app-root/src:/bin/bash" >> /etc/passwd && \
+    chown -R 1001:0 /tmp && \
+    chmod -R g=u /tmp
+
+USER 1001
+
+EXPOSE 5001 8080
+
+ENTRYPOINT ["debug-entrypoint"]
+CMD ["docling-serve", "run"]

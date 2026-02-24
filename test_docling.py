@@ -12,8 +12,11 @@ Usage:
   # Run both diagnostics and benchmark
   python3 test_docling.py --diag --benchmark --base-url http://localhost:5001 --input-dir ./files
 
-  # Run benchmark with specific tasks (1=default, 2=rapidocr, 3=advanced, 4=all features)
+  # Run benchmark with specific tasks
   python3 test_docling.py --benchmark --base-url http://localhost:5001 --input-dir ./files --tasks 1 2 3
+
+  # Standard pipeline tasks: 1=default, 2=rapidocr, 3=advanced, 4=all features
+  # VLM pipeline tasks: 5=vlm-granite-docling, 6=vlm-granite-vllm, 7=vlm-smoldocling, 8=vlm-vision-2b
 
   # Specify number of runs per test
   python3 test_docling.py --benchmark --base-url http://localhost:5001 --input-dir ./files --runs 3
@@ -210,38 +213,68 @@ def run_diagnostics():
 # ============================================================
 
 TASKS = {
+    # ---- Standard pipeline tasks ----
     "1": {
-        "name": "default (no args)",
+        "name": "std-default",
         "fields": [("document_timeout", "600")],
     },
     "2": {
-        "name": "rapidocr basic",
+        "name": "std-rapidocr",
         "fields": [("ocr_engine", "rapidocr"), ("document_timeout", "600")],
     },
     "3": {
-        "name": "rapidocr advanced",
+        "name": "std-advanced",
         "fields": [
             ("do_ocr", "true"),
             ("do_table_structure", "true"),
             ("table_mode", "accurate"),
             ("ocr_engine", "rapidocr"),
-            ("do_code_enrichment", "true"),
-            ("do_formula_enrichment", "true"),
             ("do_picture_classification", "true"),
             ("document_timeout", "600"),
         ],
     },
     "4": {
-        "name": "all features",
+        "name": "std-all-features",
         "fields": [
             ("do_ocr", "true"),
             ("do_table_structure", "true"),
             ("table_mode", "accurate"),
             ("ocr_engine", "rapidocr"),
-            ("do_code_enrichment", "true"),
-            ("do_formula_enrichment", "true"),
             ("do_picture_classification", "true"),
             ("do_picture_description", "true"),
+            ("document_timeout", "600"),
+        ],
+    },
+    # ---- VLM pipeline tasks ----
+    "5": {
+        "name": "vlm-granite-docling",
+        "fields": [
+            ("pipeline", "vlm"),
+            ("vlm_pipeline_preset", "granite_docling"),
+            ("document_timeout", "600"),
+        ],
+    },
+    "6": {
+        "name": "vlm-granite-vllm",
+        "fields": [
+            ("pipeline", "vlm"),
+            ("vlm_pipeline_custom_config", '{"model_spec":{"repo_id":"ibm-granite/granite-docling-258M"},"engine_options":{"engine_type":"vllm"}}'),
+            ("document_timeout", "600"),
+        ],
+    },
+    "7": {
+        "name": "vlm-smoldocling",
+        "fields": [
+            ("pipeline", "vlm"),
+            ("vlm_pipeline_preset", "smoldocling"),
+            ("document_timeout", "600"),
+        ],
+    },
+    "8": {
+        "name": "vlm-vision-2b",
+        "fields": [
+            ("pipeline", "vlm"),
+            ("vlm_pipeline_custom_config", '{"model_spec":{"repo_id":"ibm-granite/granite-vision-3.3-2b"},"engine_options":{"engine_type":"transformers"}}'),
             ("document_timeout", "600"),
         ],
     },
@@ -346,25 +379,25 @@ def run_benchmark(base_url, input_dir, tasks, runs, timeout):
             }
 
             status = f"{round(sum(procs)/len(procs), 1)}s" if procs else "FAIL"
-            print(f"  {fname:20s} | {task['name']:20s} | {status}")
+            print(f"  {fname:20s} | {task['name']:25s} | {status}")
 
     return results
 
 
 def print_results_table(results):
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 95)
     print("BENCHMARK RESULTS")
-    print("=" * 90)
-    print(f"{'File':<22} {'Task':<22} {'Proc Avg (s)':>12} {'Wall Avg (s)':>12} {'OK/Fail':>8}")
-    print("-" * 90)
+    print("=" * 95)
+    print(f"{'File':<22} {'Task':<25} {'Proc Avg (s)':>12} {'Wall Avg (s)':>12} {'OK/Fail':>8}")
+    print("-" * 95)
 
     for fname, tasks in results.items():
         for task_name, data in tasks.items():
             proc = f"{data['proc_avg']:.2f}" if data['proc_avg'] else "N/A"
             wall = f"{data['wall_avg']:.2f}" if data['wall_avg'] else "N/A"
             ok_fail = f"{data['runs_ok']}/{data['runs_fail']}"
-            print(f"{fname:<22} {task_name:<22} {proc:>12} {wall:>12} {ok_fail:>8}")
-        print("-" * 90)
+            print(f"{fname:<22} {task_name:<25} {proc:>12} {wall:>12} {ok_fail:>8}")
+        print("-" * 95)
 
 
 # ============================================================
@@ -386,7 +419,9 @@ def main():
     p.add_argument("--input-dir", default="./files",
                     help="Directory with test PDF files (default: ./files)")
     p.add_argument("--tasks", nargs="*", default=["1", "2", "3"],
-                    help="Task IDs: 1=default 2=rapidocr 3=advanced 4=all (default: 1 2 3)")
+                    help="Task IDs: 1=std-default 2=std-rapidocr 3=std-advanced "
+                         "4=std-all 5=vlm-granite 6=vlm-vllm 7=vlm-smol 8=vlm-vision "
+                         "(default: 1 2 3)")
     p.add_argument("--runs", type=int, default=2,
                     help="Runs per test (default: 2)")
     p.add_argument("--timeout", type=int, default=600,
