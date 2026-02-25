@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GPU-optimized Docker image for [docling-serve](https://github.com/docling-project/docling-serve) (v1.12.0) with CUDA 12.8. Fixes 8 critical bugs in the official `docling-serve-cu128` image that cause GPU underperformance (ONNX on CPU, missing CUDA libs, RapidOCR ignoring GPU, torch.compile crashes, etc.).
+GPU-optimized Docker image for [docling-serve](https://github.com/docling-project/docling-serve) (v1.13.1) with CUDA 12.8. Fixes 8 critical bugs in the official `docling-serve-cu128` image that cause GPU underperformance (ONNX on CPU, missing CUDA libs, RapidOCR ignoring GPU, torch.compile crashes, etc.).
 
 ## Build & Run
 
@@ -60,7 +60,7 @@ docker exec -it <id> python3 /opt/app-root/src/benchmark_onnx_sessions.py
 
 **Stage 1 - Builder** (`nvidia/cuda:12.8.0-devel-ubuntu24.04`):
 - Python 3.12 via deadsnakes PPA, `uv` package manager
-- Clones docling-serve v1.12.0, installs via two-pass `uv sync` (flash-attn uses prebuilt wheels for compute cap 8.0+)
+- Clones docling-serve v1.13.1, installs via two-pass `uv sync` (flash-attn uses prebuilt wheels for compute cap 8.0+)
 - Swaps `onnxruntime` (CPU) → `onnxruntime-gpu` with build-time CUDAExecutionProvider verification
 - Security upgrades (pillow, cryptography) done here so the COPY layer is Trivy-clean
 

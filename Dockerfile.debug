@@ -71,7 +71,7 @@ WORKDIR /opt/app-root/src
 RUN uv venv --python /usr/bin/python3.12 --clear /opt/app-root
 
 # ---------- Clone docling-serve ----------
-ARG DOCLING_SERVE_REF=v1.12.0
+ARG DOCLING_SERVE_REF=v1.13.1
 RUN git clone --depth 1 --branch ${DOCLING_SERVE_REF} \
         https://github.com/docling-project/docling-serve.git /opt/docling-serve
 

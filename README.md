@@ -47,7 +47,7 @@ print('ALL GOOD - GPU support confirmed')
 ## What's Included
 
 - **Base**: `nvidia/cuda:12.8.0-devel-ubuntu22.04`
-- **docling-serve**: v1.12.0
+- **docling-serve**: v1.13.1
 - **Python**: 3.12 (deadsnakes PPA)
 - **GPU acceleration**: ONNX Runtime GPU, PyTorch cu128, flash-attn (compiled with nvcc)
 - **Pre-downloaded models**: layout, tableformer, picture_classifier, rapidocr, easyocr

@@ -16,7 +16,7 @@ Usage:
   python3 test_docling.py --benchmark --base-url http://localhost:5001 --input-dir ./files --tasks 1 2 3
 
   # Standard pipeline tasks: 1=default, 2=rapidocr, 3=advanced, 4=all features
-  # VLM pipeline tasks: 5=vlm-granite-docling, 6=vlm-granite-vllm, 7=vlm-smoldocling, 8=vlm-vision-2b
+  # VLM pipeline tasks: 5=vlm-default, 6=vlm-default-vllm, 7=vlm-smoldocling, 8=vlm-vision-2b
 
   # Specify number of runs per test
   python3 test_docling.py --benchmark --base-url http://localhost:5001 --input-dir ./files --runs 3
@@ -247,15 +247,15 @@ TASKS = {
     },
     # ---- VLM pipeline tasks ----
     "5": {
-        "name": "vlm-granite-docling",
+        "name": "vlm-default",
         "fields": [
             ("pipeline", "vlm"),
-            ("vlm_pipeline_preset", "granite_docling"),
+            ("vlm_pipeline_preset", "default"),
             ("document_timeout", "600"),
         ],
     },
     "6": {
-        "name": "vlm-granite-vllm",
+        "name": "vlm-default-vllm",
         "fields": [
             ("pipeline", "vlm"),
             ("vlm_pipeline_custom_config", '{"model_spec":{"repo_id":"ibm-granite/granite-docling-258M"},"engine_options":{"engine_type":"vllm"}}'),
@@ -420,7 +420,7 @@ def main():
                     help="Directory with test PDF files (default: ./files)")
     p.add_argument("--tasks", nargs="*", default=["1", "2", "3"],
                     help="Task IDs: 1=std-default 2=std-rapidocr 3=std-advanced "
-                         "4=std-all 5=vlm-granite 6=vlm-vllm 7=vlm-smol 8=vlm-vision "
+                         "4=std-all 5=vlm-default 6=vlm-vllm 7=vlm-smol 8=vlm-vision "
                          "(default: 1 2 3)")
     p.add_argument("--runs", type=int, default=2,
                     help="Runs per test (default: 2)")
