@@ -104,6 +104,16 @@ RUN uv pip install --no-cache-dir \
         "pillow>=12.1.1" \
         "cryptography>=46.0.5"
 
+# ---------- Install vLLM for accelerated VLM inference (6.8x over transformers) ----------
+# vLLM adjusts torch (2.10→2.9.1) and torchvision to compatible versions.
+# Reinstall flash-attn with --no-deps to avoid re-upgrading torch (which would break torchvision).
+# Re-ensure onnxruntime-gpu is present (vLLM may pull in CPU-only onnxruntime).
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install "vllm>=0.17,<0.18" && \
+    uv pip install --no-deps --force-reinstall "flash-attn>=2.7" \
+        --find-links https://github.com/Dao-AILab/flash-attention/releases/expanded_assets/v2.8.3 && \
+    uv pip install --no-cache-dir onnxruntime-gpu
+
 # ---------- Build-time verification ----------
 RUN /opt/app-root/bin/python3 -c "\
 import onnxruntime as ort; \
@@ -185,20 +195,24 @@ COPY --chown=1001:0 models/docling-project--docling-models         ${DOCLING_SER
 COPY --chown=1001:0 models/docling-project--DocumentFigureClassifier-v2.0 ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--DocumentFigureClassifier-v2.0
 COPY --chown=1001:0 models/RapidOcr                                ${DOCLING_SERVE_ARTIFACTS_PATH}/RapidOcr
 COPY --chown=1001:0 models/EasyOcr                                 ${DOCLING_SERVE_ARTIFACTS_PATH}/EasyOcr
+COPY --chown=1001:0 models/docling-project--CodeFormulaV2            ${DOCLING_SERVE_ARTIFACTS_PATH}/docling-project--CodeFormulaV2
 
 # ---------- Tuning & feature ENV (safe to change without re-downloading models) ----------
 ENV TORCH_COMPILE_DISABLE=1 \
     TORCHINDUCTOR_DISABLE=1 \
     # VLM picture description
     DOCLING_PICTURE_DESCRIPTION_MODEL_TYPE=vlm \
-    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=ibm-granite/granite-vision-3.3-2b \
+    DOCLING_PICTURE_DESCRIPTION_VLM_MODEL_ID=/opt/app-root/src/.cache/docling/models/vlm/ibm-granite--granite-vision-3.3-2b \
     DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda \
     DOCLING_PICTURE_DESCRIPTION_BACKEND=vlm \
     # Docling-serve runtime
     DOCLING_SERVE_ENGINE=DoclingParseV2DocumentBackend \
     DOCLING_SERVE_MAX_SYNC_WAIT=1200 \
     DOCLING_SERVE_MAX_DOCUMENT_TIMEOUT=1200 \
-    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+    DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2 \
+    # Prevent model downloads/updates — all models baked or mounted
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 # ---------- Save baked-in classifier to a safe location ----------
 # Volume mounts can overlay /opt/app-root/src/.cache/docling/models, hiding the
@@ -243,25 +257,38 @@ RUN printf '%s\n' \
     > /usr/local/bin/container-entrypoint && \
     chmod +x /usr/local/bin/container-entrypoint
 
-# ---------- Patch RapidOCR: enable CUDA for ONNX Runtime (bug #5) ----------
-# docling sets Det.use_cuda but RapidOCR v3.7.0 reads EngineConfig.onnxruntime.use_cuda
-# which defaults to false — this patch adds the correct config key
+# ---------- Patch RapidOCR: enable CUDA + switch to PP-OCRv5 (bug #5) ----------
+# 1. CUDA fix: docling sets Det.use_cuda but RapidOCR v3.7.0 reads
+#    EngineConfig.onnxruntime.use_cuda which defaults to false
+# 2. PP-OCRv5: override default v4 model paths with v5 server models
 RUN RAPID_OCR_MODEL=/opt/app-root/lib/python3.12/site-packages/docling/models/stages/ocr/rapid_ocr_model.py && \
     /opt/app-root/bin/python3 -c "\
 from pathlib import Path; \
 p = Path('$RAPID_OCR_MODEL'); \
 src = p.read_text(); \
+# Patch 1: Add ONNX Runtime CUDA config \
 src = src.replace( \
     '\"EngineConfig.paddle.use_cuda\": use_cuda,', \
     '\"EngineConfig.onnxruntime.use_cuda\": use_cuda,\n' \
     '                \"EngineConfig.onnxruntime.cuda_ep_cfg.device_id\": gpu_id,\n' \
     '                \"EngineConfig.paddle.use_cuda\": use_cuda,' \
 ); \
+# Patch 2: Override model paths to PP-OCRv5 server models \
+MODELS = '/opt/app-root/src/.cache/docling/models/RapidOcr/onnx/PP-OCRv5'; \
+src = src.replace( \
+    'if user_params:', \
+    f'params[\"Det.model_path\"] = \"{MODELS}/det/PP-OCRv5_server_det_infer.onnx\"\n' \
+    f'            params[\"Rec.model_path\"] = \"{MODELS}/rec/PP-OCRv5_server_rec_infer.onnx\"\n' \
+    f'            params[\"Rec.rec_keys_path\"] = \"{MODELS}/rec/ppocrv5_dict.txt\"\n' \
+    '            if user_params:' \
+); \
 p.write_text(src); \
-print('CUDA patch applied successfully'); \
+print('CUDA + PP-OCRv5 patch applied successfully'); \
 " && \
     grep -q 'EngineConfig.onnxruntime.use_cuda' "$RAPID_OCR_MODEL" || \
-        { echo "FATAL: RapidOCR CUDA patch failed"; exit 1; }
+        { echo "FATAL: RapidOCR CUDA patch failed"; exit 1; } && \
+    grep -q 'PP-OCRv5_server_det_infer' "$RAPID_OCR_MODEL" || \
+        { echo "FATAL: PP-OCRv5 model path patch failed"; exit 1; }
 
 # ---------- Non-root user ----------
 # /opt/app-root already owned by 1001:0 (COPY --chown) with g=u perms (set in builder)
