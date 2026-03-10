@@ -65,7 +65,7 @@ WORKDIR /opt/app-root/src
 RUN uv venv --python /usr/bin/python3.12 --clear /opt/app-root
 
 # ---------- Clone docling-serve ----------
-ARG DOCLING_SERVE_REF=v1.13.1
+ARG DOCLING_SERVE_REF=v1.14.3
 RUN git clone --depth 1 --branch ${DOCLING_SERVE_REF} \
         https://github.com/docling-project/docling-serve.git /opt/docling-serve
 
@@ -92,6 +92,10 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip uninstall onnxruntime && \
     uv pip install --no-cache-dir onnxruntime-gpu
+
+# ---------- Upgrade RapidOCR to v3.7.0 (PP-OCRv5 support) ----------
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --no-cache-dir "rapidocr>=3.7.0"
 
 # ---------- Fix security vulnerabilities in builder (so COPY layer is clean) ----------
 # Must be done here, NOT in runtime stage, otherwise Trivy flags the old
@@ -162,7 +166,7 @@ ENV APP_ROOT=/opt/app-root \
     TRANSFORMERS_CACHE=/opt/app-root/src/.cache/huggingface \
     HF_HUB_CACHE=/opt/app-root/src/.cache/huggingface/hub \
     TORCH_HOME=/opt/app-root/src/.cache/torch \
-    # Performance
+    # Performance — docling defaults
     OMP_NUM_THREADS=4 \
     MKL_NUM_THREADS=4 \
     # OCR
@@ -239,13 +243,23 @@ RUN printf '%s\n' \
     > /usr/local/bin/container-entrypoint && \
     chmod +x /usr/local/bin/container-entrypoint
 
-# ---------- Fix RapidOCR CUDA: patch docling to set EngineConfig.onnxruntime.use_cuda ----------
-# Bug: docling sets Det.use_cuda=True but RapidOCR's ProviderConfig reads
-# EngineConfig.onnxruntime.use_cuda (defaults to false), so OCR runs on CPU.
-# This sed adds the missing onnxruntime engine config entries to rapid_ocr_model.py.
+# ---------- Patch RapidOCR: enable CUDA for ONNX Runtime (bug #5) ----------
+# docling sets Det.use_cuda but RapidOCR v3.7.0 reads EngineConfig.onnxruntime.use_cuda
+# which defaults to false — this patch adds the correct config key
 RUN RAPID_OCR_MODEL=/opt/app-root/lib/python3.12/site-packages/docling/models/stages/ocr/rapid_ocr_model.py && \
-    sed -i 's|"EngineConfig.paddle.use_cuda": use_cuda,|"EngineConfig.onnxruntime.use_cuda": use_cuda,\n                "EngineConfig.onnxruntime.cuda_ep_cfg.device_id": gpu_id,\n                "EngineConfig.paddle.use_cuda": use_cuda,|' \
-        "$RAPID_OCR_MODEL" && \
+    /opt/app-root/bin/python3 -c "\
+from pathlib import Path; \
+p = Path('$RAPID_OCR_MODEL'); \
+src = p.read_text(); \
+src = src.replace( \
+    '\"EngineConfig.paddle.use_cuda\": use_cuda,', \
+    '\"EngineConfig.onnxruntime.use_cuda\": use_cuda,\n' \
+    '                \"EngineConfig.onnxruntime.cuda_ep_cfg.device_id\": gpu_id,\n' \
+    '                \"EngineConfig.paddle.use_cuda\": use_cuda,' \
+); \
+p.write_text(src); \
+print('CUDA patch applied successfully'); \
+" && \
     grep -q 'EngineConfig.onnxruntime.use_cuda' "$RAPID_OCR_MODEL" || \
         { echo "FATAL: RapidOCR CUDA patch failed"; exit 1; }
 

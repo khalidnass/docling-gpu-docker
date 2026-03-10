@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GPU-optimized Docker image for [docling-serve](https://github.com/docling-project/docling-serve) (v1.13.1) with CUDA 12.8. Fixes 8 critical bugs in the official `docling-serve-cu128` image that cause GPU underperformance (ONNX on CPU, missing CUDA libs, RapidOCR ignoring GPU, torch.compile crashes, etc.).
+GPU-optimized Docker image for [docling-serve](https://github.com/docling-project/docling-serve) (v1.14.3) with CUDA 12.8. Fixes 8 critical bugs in the official `docling-serve-cu128` image that cause GPU underperformance (ONNX on CPU, missing CUDA libs, RapidOCR ignoring GPU, torch.compile crashes, etc.).
 
 ## Build & Run
 
@@ -60,7 +60,7 @@ docker exec -it <id> python3 /opt/app-root/src/benchmark_onnx_sessions.py
 
 **Stage 1 - Builder** (`nvidia/cuda:12.8.0-devel-ubuntu24.04`):
 - Python 3.12 via deadsnakes PPA, `uv` package manager
-- Clones docling-serve v1.13.1, installs via two-pass `uv sync` (flash-attn uses prebuilt wheels for compute cap 8.0+)
+- Clones docling-serve v1.14.3, installs via two-pass `uv sync` (flash-attn uses prebuilt wheels for compute cap 8.0+)
 - Swaps `onnxruntime` (CPU) → `onnxruntime-gpu` with build-time CUDAExecutionProvider verification
 - Security upgrades (pillow, cryptography) done here so the COPY layer is Trivy-clean
 
@@ -102,13 +102,24 @@ Extends `Dockerfile` with:
 - VLM: `ibm-granite/granite-vision-3.3-2b` downloaded at runtime on CUDA
 - VLM: `ibm-granite/granite-docling-258M` — 258M param single-pass VLM (debug image only)
 
+### Configuration (docling defaults preserved)
+
+The production image keeps all docling defaults intact:
+- `OMP_NUM_THREADS=4`, `MKL_NUM_THREADS=4` (docling defaults)
+- `DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2` (docling default)
+- No pipeline batching ENV overrides
+- No OCR scale override (stays 3 = 216 DPI)
+- Default OCR uses v4 mobile models (PP-OCRv5 available but not default)
+
+Users can override any of these via `-e` flags at runtime.
+
 ### Key Environment Variables
 
 - `TORCH_COMPILE_DISABLE=1` / `TORCHINDUCTOR_DISABLE=1` — prevents GPU crashes
-- `OMP_NUM_THREADS=4`, `MKL_NUM_THREADS=4` — threading tuning
+- `OMP_NUM_THREADS=4`, `MKL_NUM_THREADS=4` — docling defaults
 - `DOCLING_SERVE_ARTIFACTS_PATH` / `DOCLING_ARTIFACTS_PATH` — model cache paths
 - `DOCLING_PICTURE_DESCRIPTION_VLM_DEVICE=cuda` — VLM runs on GPU
-- `DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2` — processing workers
+- `DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2` — docling default (2 workers)
 
 ## File Descriptions
 
@@ -123,6 +134,8 @@ Extends `Dockerfile` with:
 - `debug_entrypoint.sh` — Enhanced entrypoint with startup diagnostics
 - `INVESTIGATION.md` — Full pipeline investigation report with profiling data and optimization recommendations
 - `h20_diag.sh` — Self-contained diagnostic for H100/H200 cloud pods
+- `patches/ocr_page_batch_patch.py` — Build-time patch: batch OCR cls+rec across crops (Phase 3, Step 8)
+- `patches/onnx_session_opt_patch.py` — Build-time patch: ONNX session memory/execution opts (Phase 3, Step 9)
 - `files/` — Test PDFs for benchmarking (gitignored)
 
 ## Performance Findings (A5000, CUDA 12.8)
